@@ -1,0 +1,14 @@
+{
+  "name": "minimax-watcher",
+  "version": "1.0.0",
+  "description": "Watch MiniMax token-plan usage and toggle NewAPI channel automatically",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node watch.mjs",
+    "once": "node watch.mjs --once"
+  }
+}
