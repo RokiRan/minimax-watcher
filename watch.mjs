@@ -612,9 +612,9 @@ async function tick() {
   //   旧版用 "prevPct < threshold" 边沿检测，会因为"首次启用 Bark 时当前读数
   //   已经过线"或"中途调低阈值"两种场景漏报，所以废弃。
   // 去重策略（重置）：
-  //   nowMs 已跨过 *上一次观察到的* resetAtMs，且该旧 resetAtMs 的秒级 ID
-  //   还没通知过。注意不能用 plan.resetAtMs 判断——那是"当前周期的结束时间"，
-  //   永远在未来，触发出来就是误报。
+  //   "重置" 定义为"使用率从 ≥ 阈值 降到 < 阈值"（falling edge），即
+  //   prevPct >= threshold && currPct < threshold。
+  //   边沿天然去重——同一次下降只触发一次，不会重复。
   if (cfg.bark.deviceKey && plan.usagePct != null) {
     const prevResetAtMs = state.lastObservedResetAtMs;
     const currResetAtMs = plan.resetAtMs;
@@ -622,17 +622,22 @@ async function tick() {
       currResetAtMs != null ? Math.floor(currResetAtMs / 1000) : null;
     const prevCycleId =
       prevResetAtMs != null ? Math.floor(prevResetAtMs / 1000) : null;
-    const overThreshold = plan.usagePct >= cfg.threshold;
+    const currPct = plan.usagePct;
+    const prevPct = state.lastObservedUsagePct;
+    const overThreshold = currPct >= cfg.threshold;
     const sameThreshold = state.lastNotifiedThreshold === cfg.threshold;
     const sameCycle =
       currCycleId != null && state.lastNotifiedThresholdCycleId === currCycleId;
     const thresholdNeedNotify = overThreshold && !(sameThreshold && sameCycle);
+    // 边沿检测要求 prevPct 非空（首次 tick 视为"基线未知"，不发推送）
+    const fallingEdge =
+      prevPct != null && prevPct >= cfg.threshold && currPct < cfg.threshold;
 
     if (thresholdNeedNotify) {
-      const remainPct = Math.max(0, 100 - plan.usagePct);
+      const remainPct = Math.max(0, 100 - currPct);
       const resetHint = currResetAtMs ? `\n重置时间：${formatTime(currResetAtMs)}` : '';
       await sendBark({
-        title: `⚠️ MiniMax 用量已达 ${plan.usagePct.toFixed(2)}%`,
+        title: `⚠️ MiniMax 用量已达 ${currPct.toFixed(2)}%`,
         body: `已超过阈值 ${cfg.threshold}%，剩余约 ${remainPct.toFixed(2)}%。${resetHint}`,
         level: cfg.bark.thresholdLevel,
       });
@@ -640,26 +645,17 @@ async function tick() {
       state.lastNotifiedThresholdCycleId = currCycleId;
     }
 
-    if (
-      prevResetAtMs != null &&
-      nowMs >= prevResetAtMs &&
-      prevCycleId !== state.lastNotifiedResetCycleId
-    ) {
-      const prevPctInfo =
-        state.lastObservedUsagePct != null
-          ? `${state.lastObservedUsagePct.toFixed(2)}%`
-          : '未知';
+    if (fallingEdge) {
       await sendBark({
-        title: '✅ MiniMax 用量已重置',
+        title: '✅ MiniMax 渠道已恢复',
         body:
-          `新周期已开始，当前用量 ${plan.usagePct.toFixed(2)}%` +
-          `（上一周期峰值 ${prevPctInfo}）。\n下次重置：${formatTime(currResetAtMs)}`,
+          `用量从 ${prevPct.toFixed(2)}% 降至 ${currPct.toFixed(2)}%，` +
+          `已低于阈值 ${cfg.threshold}%。`,
         level: cfg.bark.resetLevel,
       });
-      state.lastNotifiedResetCycleId = prevCycleId;
     }
 
-    state.lastObservedUsagePct = plan.usagePct;
+    state.lastObservedUsagePct = currPct;
     state.lastObservedResetAtMs = currResetAtMs;
     state.lastTickAt = nowMs;
     saveStateDebounced();

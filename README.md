@@ -123,13 +123,13 @@ NEWAPI_CHANNEL_STATUS_DISABLED=2
 
 | 触发点 | 标题示例 | 推送条件 |
 |---|---|---|
-| 用量 ≥ `USAGE_THRESHOLD` | `⚠️ MiniMax 用量已达 99.32%` | 上升沿触发（用上次记录的 `usagePct` 做边沿检测），同一周期内不会重复推送 |
-| 用量进入新周期（`nowMs >= resetAtMs`） | `✅ MiniMax 用量已重置` | 同一 `resetAtMs`（秒级）只推一次 |
+| 用量 ≥ `USAGE_THRESHOLD` | `⚠️ MiniMax 用量已达 99.32%` | 在同一 `(threshold, cycleId)` 组合下仅推一次；调低阈值或进入新周期视为新事件 |
+| 用量从 ≥ 阈值 降到 < 阈值 | `✅ MiniMax 渠道已恢复` | 边沿触发，同一次下降只推一次 |
 
 **去重保证**：
 
-- 阈值通知用"上次观察到的 `usagePct`"做边沿检测；同一周期内即使反复轮询也只发一次。
-- 重置通知用 `Math.floor(resetAtMs / 1000)` 作为"周期 ID"；只有当接口返回的 `resetAtMs` 进入新周期才发推送。
+- 阈值通知用 `(lastNotifiedThreshold, lastNotifiedThresholdCycleId)` 元组判重：同一组合内不重复，threshold 变化或 cycleId 变化时允许再推。
+- 重置通知用边沿检测（`prevPct >= threshold && currPct < threshold`）：每次真正"过线后回来"才推一次，天然不会重复。
 - 状态持久化到 `STATE_FILE`（默认 `./state.json`，已加入 `.gitignore`），重启后不会重报上一次的旧事件。
 - 关闭 Bark 或删除 `state.json` 都会让脚本"重新通知"——属于预期行为，便于排错。
 
