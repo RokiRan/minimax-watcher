@@ -95,10 +95,35 @@ const cfg = {
     // 您需要先在 NewAPI 后台给要监控的渠道打上一个 tag（如 "minimax"），脚本用 tag 控制。
     tag: process.env.NEWAPI_CHANNEL_TAG || '',
   },
+  // Bark 推送（iOS 通知服务 https://bark.day.app/）。
+  // 留空 BARK_DEVICE_KEY 即视为关闭 Bark，所有通知相关代码自动跳过，不影响 NewAPI 控制。
+  bark: {
+    url: (process.env.BARK_URL || 'https://api.day.app').replace(/\/+$/, ''),
+    deviceKey: process.env.BARK_DEVICE_KEY || '',
+    group: process.env.BARK_GROUP || 'minimax-watcher',
+    icon: process.env.BARK_ICON || '',
+    timeoutMs: Number(process.env.BARK_TIMEOUT_MS ?? 5000),
+    // Bark level: active / timeSensitive / passive
+    thresholdLevel: process.env.BARK_THRESHOLD_LEVEL || 'timeSensitive',
+    resetLevel: process.env.BARK_RESET_LEVEL || 'timeSensitive',
+  },
   threshold: Number(process.env.USAGE_THRESHOLD ?? 99),
   pollIntervalMs: Number(process.env.POLL_INTERVAL_MS ?? 30 * 1000),
   logLevel: process.env.LOG_LEVEL || 'info',
   runOnce: RUN_ONCE || String(process.env.RUN_ONCE).toLowerCase() === 'true',
+  // 本地状态文件路径（用于 Bark 通知去重）。留空 = 关闭持久化。
+  // 仅在 Bark 启用时才会真正读写。
+  stateFile: process.env.STATE_FILE || resolve(__dirname, 'state.json'),
+};
+
+// 运行时状态（Bark 通知去重专用）。在 main() 启动时由 loadState() 覆盖。
+let state = {
+  lastNotifiedThresholdCycleId: null,
+  lastNotifiedResetCycleId: null,
+  lastNotifiedThreshold: null,
+  lastTickAt: null,
+  lastObservedUsagePct: null,
+  lastObservedResetAtMs: null,
 };
 
 // ---------- 校验 ----------
@@ -396,6 +421,114 @@ async function tagChannel(action, reason) {
   return json;
 }
 
+// ---------- 本地状态（Bark 通知去重专用）----------
+// 设计要点：
+//   - 仅在 Bark 启用（BARK_DEVICE_KEY 非空）时才会读写；其他场景完全无副作用。
+//   - 关键字段：lastNotifiedThresholdCycleId / lastNotifiedResetCycleId。
+//     "cycleId" = Math.floor(resetAtMs / 1000)，即当前账单周期的秒级时间戳。
+//     重置后 resetAtMs 会换新值 → cycleId 变化 → 下一周期允许再次通知；
+//     同一周期内不论轮询多少次都只发一次。
+//   - 字段缺失/类型异常一律按"未通知"处理，保证老 state.json 不会卡住去重逻辑。
+const DEFAULT_STATE = Object.freeze({
+  lastNotifiedThresholdCycleId: null,
+  lastNotifiedResetCycleId: null,
+  lastNotifiedThreshold: null,
+  lastTickAt: null,
+  lastObservedUsagePct: null,
+  lastObservedResetAtMs: null,
+});
+
+function normalizeState(raw) {
+  const out = { ...DEFAULT_STATE };
+  if (raw && typeof raw === 'object') {
+    for (const k of Object.keys(DEFAULT_STATE)) {
+      const v = raw[k];
+      out[k] = v == null || v === '' ? null : v;
+    }
+  }
+  return out;
+}
+
+function loadState() {
+  if (!cfg.bark.deviceKey || !cfg.stateFile) return { ...DEFAULT_STATE };
+  if (!existsSync(cfg.stateFile)) return { ...DEFAULT_STATE };
+  try {
+    const text = readFileSync(cfg.stateFile, 'utf8');
+    const parsed = JSON.parse(text);
+    return normalizeState(parsed);
+  } catch (e) {
+    log('warn', 'state.json 读取失败，按空状态继续', { err: e.message });
+    return { ...DEFAULT_STATE };
+  }
+}
+
+let stateSaveTimer = null;
+let stateDirty = false;
+function saveStateNow() {
+  if (!cfg.bark.deviceKey || !cfg.stateFile) return;
+  try {
+    writeFileSync(cfg.stateFile, JSON.stringify(state, null, 2));
+    stateDirty = false;
+  } catch (e) {
+    log('error', 'state.json 写入失败', { err: e.message });
+  }
+}
+/**
+ * 异步落盘：单线程内同步写 fs 没问题，但留个 debounce 防止 tick 抖动时连续 IO。
+ */
+function saveStateDebounced() {
+  if (!cfg.bark.deviceKey || !cfg.stateFile) return;
+  stateDirty = true;
+  if (stateSaveTimer) return;
+  stateSaveTimer = setTimeout(() => {
+    stateSaveTimer = null;
+    if (stateDirty) saveStateNow();
+  }, 200);
+}
+
+// ---------- Bark 推送 ----------
+/**
+ * 调 Bark 发送一条通知。永不抛错（吞掉异常 + 打日志），
+ * 避免 Bark 抖动让主监控循环崩。
+ *
+ * 协议：POST {BARK_URL}/{deviceKey}，body 为 JSON。
+ * 文档：https://bark.day.app/#/tutorial
+ */
+async function sendBark({ title, body, level, group, icon }) {
+  if (!cfg.bark.deviceKey) return; // 未启用 Bark：直接跳过
+  const url = `${cfg.bark.url}/${encodeURIComponent(cfg.bark.deviceKey)}`;
+  const payload = {
+    title: String(title ?? ''),
+    body: String(body ?? ''),
+    group: group ?? cfg.bark.group,
+    level: level ?? 'active',
+  };
+  if (cfg.bark.icon) payload.icon = cfg.bark.icon;
+
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), cfg.bark.timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: ac.signal,
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      log('error', 'Bark 推送失败', { status: res.status, body: text.slice(0, 200) });
+      return false;
+    }
+    log('info', 'Bark 推送成功', { title: payload.title, level: payload.level });
+    return true;
+  } catch (e) {
+    log('error', 'Bark 推送异常', { err: e.message });
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 // ---------- 决策（纯函数：只依赖当前查询结果）----------
 // 思路：
 //   - 用量 ≥ 阈值 → 调 NewAPI 禁用带 tag 的渠道
@@ -469,17 +602,82 @@ async function tick() {
       log('error', '启用渠道失败', { err: e.message });
     }
   }
+
+  // ---------- Bark 通知（仅在配置了 BARK_DEVICE_KEY 时生效）----------
+  // 去重策略（阈值）：
+  //   用 (lastNotifiedThreshold, lastNotifiedThresholdCycleId) 元组判重。
+  //   - 同 (threshold, cycleId) → 不通知（已通知过本周期该阈值）。
+  //   - threshold 变了（比如从 99 调到 39）→ 视为新事件，下次过线立即通知。
+  //   - cycleId 变了（重置进入新周期）→ 允许再通知。
+  //   旧版用 "prevPct < threshold" 边沿检测，会因为"首次启用 Bark 时当前读数
+  //   已经过线"或"中途调低阈值"两种场景漏报，所以废弃。
+  // 去重策略（重置）：
+  //   nowMs 已跨过 *上一次观察到的* resetAtMs，且该旧 resetAtMs 的秒级 ID
+  //   还没通知过。注意不能用 plan.resetAtMs 判断——那是"当前周期的结束时间"，
+  //   永远在未来，触发出来就是误报。
+  if (cfg.bark.deviceKey && plan.usagePct != null) {
+    const prevResetAtMs = state.lastObservedResetAtMs;
+    const currResetAtMs = plan.resetAtMs;
+    const currCycleId =
+      currResetAtMs != null ? Math.floor(currResetAtMs / 1000) : null;
+    const prevCycleId =
+      prevResetAtMs != null ? Math.floor(prevResetAtMs / 1000) : null;
+    const overThreshold = plan.usagePct >= cfg.threshold;
+    const sameThreshold = state.lastNotifiedThreshold === cfg.threshold;
+    const sameCycle =
+      currCycleId != null && state.lastNotifiedThresholdCycleId === currCycleId;
+    const thresholdNeedNotify = overThreshold && !(sameThreshold && sameCycle);
+
+    if (thresholdNeedNotify) {
+      const remainPct = Math.max(0, 100 - plan.usagePct);
+      const resetHint = currResetAtMs ? `\n重置时间：${formatTime(currResetAtMs)}` : '';
+      await sendBark({
+        title: `⚠️ MiniMax 用量已达 ${plan.usagePct.toFixed(2)}%`,
+        body: `已超过阈值 ${cfg.threshold}%，剩余约 ${remainPct.toFixed(2)}%。${resetHint}`,
+        level: cfg.bark.thresholdLevel,
+      });
+      state.lastNotifiedThreshold = cfg.threshold;
+      state.lastNotifiedThresholdCycleId = currCycleId;
+    }
+
+    if (
+      prevResetAtMs != null &&
+      nowMs >= prevResetAtMs &&
+      prevCycleId !== state.lastNotifiedResetCycleId
+    ) {
+      const prevPctInfo =
+        state.lastObservedUsagePct != null
+          ? `${state.lastObservedUsagePct.toFixed(2)}%`
+          : '未知';
+      await sendBark({
+        title: '✅ MiniMax 用量已重置',
+        body:
+          `新周期已开始，当前用量 ${plan.usagePct.toFixed(2)}%` +
+          `（上一周期峰值 ${prevPctInfo}）。\n下次重置：${formatTime(currResetAtMs)}`,
+        level: cfg.bark.resetLevel,
+      });
+      state.lastNotifiedResetCycleId = prevCycleId;
+    }
+
+    state.lastObservedUsagePct = plan.usagePct;
+    state.lastObservedResetAtMs = currResetAtMs;
+    state.lastTickAt = nowMs;
+    saveStateDebounced();
+  }
 }
 
 // ---------- 主循环 ----------
 let stopping = false;
 async function main() {
   assertConfig();
+  state = loadState();
   log('info', 'minimax-watcher 启动', {
     threshold: cfg.threshold,
     pollIntervalMs: cfg.pollIntervalMs,
     channelId: cfg.newapi.channelId,
     runOnce: cfg.runOnce,
+    barkEnabled: Boolean(cfg.bark.deviceKey),
+    stateFile: cfg.bark.deviceKey ? cfg.stateFile : '(disabled)',
   });
 
   while (!stopping) {
@@ -503,9 +701,14 @@ function shutdown(signal) {
   if (stopping) return;
   stopping = true;
   log('warn', `收到 ${signal}，准备退出`);
+  // 退出前 flush 一次 state，避免最后一次 debounced 写丢失
+  if (stateDirty) saveStateNow();
 }
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('exit', () => {
+  if (stateDirty) saveStateNow();
+});
 process.on('unhandledRejection', (err) => {
   log('error', '未处理的 Promise 拒绝', { err: String(err) });
 });

@@ -113,9 +113,37 @@ NEWAPI_CHANNEL_STATUS_DISABLED=2
 | `POLL_INTERVAL_MS` | `30000` | 轮询间隔（30 秒） |
 | `ABORT_DISABLE_AFTER_MS` | `0` | 停用决策最长等待；0 表示永不放弃 |
 | `ENABLE_LEAD_MS` | `0` | 启用提前量，避免重置瞬间的尖刺 |
-| `STATE_FILE` | `./state.json` | 状态持久化路径 |
+| `STATE_FILE` | `./state.json` | 状态持久化路径（Bark 通知去重专用） |
 | `LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error` |
 | `RUN_ONCE` | `false` | 只跑一轮就退出（调试 / cron 用） |
+
+### Bark 通知（可选）
+
+在 `.env` 中填 `BARK_DEVICE_KEY` 即可启用 [Bark](https://bark.day.app/) iOS 推送。脚本会在两个时间点推送：
+
+| 触发点 | 标题示例 | 推送条件 |
+|---|---|---|
+| 用量 ≥ `USAGE_THRESHOLD` | `⚠️ MiniMax 用量已达 99.32%` | 上升沿触发（用上次记录的 `usagePct` 做边沿检测），同一周期内不会重复推送 |
+| 用量进入新周期（`nowMs >= resetAtMs`） | `✅ MiniMax 用量已重置` | 同一 `resetAtMs`（秒级）只推一次 |
+
+**去重保证**：
+
+- 阈值通知用"上次观察到的 `usagePct`"做边沿检测；同一周期内即使反复轮询也只发一次。
+- 重置通知用 `Math.floor(resetAtMs / 1000)` 作为"周期 ID"；只有当接口返回的 `resetAtMs` 进入新周期才发推送。
+- 状态持久化到 `STATE_FILE`（默认 `./state.json`，已加入 `.gitignore`），重启后不会重报上一次的旧事件。
+- 关闭 Bark 或删除 `state.json` 都会让脚本"重新通知"——属于预期行为，便于排错。
+
+Bark 相关变量：
+
+| 变量 | 默认 | 含义 |
+|---|---|---|
+| `BARK_DEVICE_KEY` | _(空)_ | 留空即关闭 Bark；填了才会启用推送 |
+| `BARK_URL` | `https://api.day.app` | 自建 Bark 服务时改这里 |
+| `BARK_GROUP` | `minimax-watcher` | Bark 分组名（同组通知会自动合并） |
+| `BARK_ICON` | _(空)_ | 通知图标的 URL（可选） |
+| `BARK_TIMEOUT_MS` | `5000` | Bark 请求超时 |
+| `BARK_THRESHOLD_LEVEL` | `timeSensitive` | 阈值通知级别 `active` / `timeSensitive` / `passive` |
+| `BARK_RESET_LEVEL` | `timeSensitive` | 重置通知级别 |
 
 ## 部署
 
