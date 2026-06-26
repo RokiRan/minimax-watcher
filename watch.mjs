@@ -90,15 +90,13 @@ const cfg = {
   newapi: {
     baseUrl: process.env.NEWAPI_BASE_URL || '',
     token: process.env.NEWAPI_ADMIN_TOKEN || '',
-    channelId: numberOrNull(process.env.NEWAPI_CHANNEL_ID),
-    statusEnabled: numberOrNull(process.env.NEWAPI_CHANNEL_STATUS_ENABLED) ?? 1,
-    statusDisabled: numberOrNull(process.env.NEWAPI_CHANNEL_STATUS_DISABLED) ?? 0,
+    adminUserId: numberOrNull(process.env.NEWAPI_ADMIN_USER_ID),
+    // NewAPI 推荐用 tag 接口批量控制渠道（POST /api/channel/tag/{disabled,enabled}）。
+    // 您需要先在 NewAPI 后台给要监控的渠道打上一个 tag（如 "minimax"），脚本用 tag 控制。
+    tag: process.env.NEWAPI_CHANNEL_TAG || '',
   },
-  threshold: Number(process.env.USAGE_THRESHOLD ?? 98),
+  threshold: Number(process.env.USAGE_THRESHOLD ?? 99),
   pollIntervalMs: Number(process.env.POLL_INTERVAL_MS ?? 30 * 1000),
-  abortDisableAfterMs: Number(process.env.ABORT_DISABLE_AFTER_MS ?? 0),
-  enableLeadMs: Number(process.env.ENABLE_LEAD_MS ?? 0),
-  stateFile: resolve(__dirname, process.env.STATE_FILE || './state.json'),
   logLevel: process.env.LOG_LEVEL || 'info',
   runOnce: RUN_ONCE || String(process.env.RUN_ONCE).toLowerCase() === 'true',
 };
@@ -108,7 +106,16 @@ function assertConfig() {
   const errs = [];
   if (!cfg.newapi.baseUrl) errs.push('NEWAPI_BASE_URL 未配置');
   if (!cfg.newapi.token) errs.push('NEWAPI_ADMIN_TOKEN 未配置');
-  if (cfg.newapi.channelId == null) errs.push('NEWAPI_CHANNEL_ID 未配置');
+  // new-api fork 强制要求 New-Api-User header
+  if (cfg.newapi.adminUserId == null) {
+    errs.push('NEWAPI_ADMIN_USER_ID 未配置（NewAPI 接口要求 New-Api-User header）');
+  }
+  // 用 tag 接口需要 tag 字符串
+  if (!cfg.newapi.tag) {
+    errs.push(
+      'NEWAPI_CHANNEL_TAG 未配置（NewAPI 用 tag 接口批量控制渠道；先在 NewAPI 后台给渠道打 tag）',
+    );
+  }
   if (!cfg.minimax.apiKey) errs.push('MINIMAX_API_KEY 未配置');
   if (!cfg.minimax.url) {
     // 兜底：理论上有默认值不会走到这里
@@ -206,34 +213,6 @@ function formatTime(ms) {
     return `${utc} / 北京时间 ${sh.replace(' ', ' ')} (Asia/Shanghai)`;
   } catch {
     return utc;
-  }
-}
-
-// ---------- 状态文件 ----------
-function readState() {
-  if (!existsSync(cfg.stateFile)) {
-    return { channelKnownStatus: null, lastResetAt: null, lastDisableAt: null };
-  }
-  try {
-    const data = JSON.parse(readFileSync(cfg.stateFile, 'utf8'));
-    return {
-      channelKnownStatus: data.channelKnownStatus ?? null,
-      lastResetAt: data.lastResetAt ?? null,
-      lastDisableAt: data.lastDisableAt ?? null,
-    };
-  } catch (e) {
-    log('warn', '状态文件损坏，使用空状态', { err: e.message });
-    return { channelKnownStatus: null, lastResetAt: null, lastDisableAt: null };
-  }
-}
-
-function writeState(patch) {
-  const prev = readState();
-  const next = { ...prev, ...patch };
-  try {
-    writeFileSync(cfg.stateFile, JSON.stringify(next, null, 2));
-  } catch (e) {
-    log('error', '写入状态文件失败', { err: e.message });
   }
 }
 
@@ -381,20 +360,19 @@ function parseMaxUsage(json) {
   };
 }
 
-// ---------- NewAPI 渠道管理 ----------
-async function updateChannelStatus(newStatus, reason) {
-  const url = `${cfg.newapi.baseUrl.replace(/\/+$/, '')}/api/channel/`;
-  // one-api UpdateChannel 接收完整 channel 对象；最小必要字段：id + status
-  // 同时带上 name / type 防止某些 fork 校验失败（占位 unknown，由后端忽略）
-  const body = {
-    id: cfg.newapi.channelId,
-    status: newStatus,
-  };
+// ---------- NewAPI 渠道管理（tag 接口）----------
+// 参考：https://docs.newapi.pro/zh/docs/api/management/channel-management/channel-tag-disabled-post
+// 用 tag 批量启用/禁用渠道。需要先在 NewAPI 后台给目标渠道打 tag。
+async function tagChannel(action, reason) {
+  const endpoint = action === 'disable' ? 'disabled' : 'enabled';
+  const url = `${cfg.newapi.baseUrl.replace(/\/+$/, '')}/api/channel/tag/${endpoint}`;
+  const body = { tag: cfg.newapi.tag };
   const res = await fetch(url, {
-    method: 'PUT',
+    method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${cfg.newapi.token}`,
+      'New-Api-User': String(cfg.newapi.adminUserId),
     },
     body: JSON.stringify(body),
   });
@@ -404,27 +382,27 @@ async function updateChannelStatus(newStatus, reason) {
   }
   let json;
   try {
-    json = JSON.parse(text);
+    json = text ? JSON.parse(text) : {};
   } catch {
     json = { raw: text };
   }
   if (json && typeof json === 'object' && 'success' in json && !json.success) {
     throw new Error(`NewAPI 返回 success=false: ${JSON.stringify(json).slice(0, 200)}`);
   }
-  log('info', `NewAPI 渠道状态已更新`, {
-    channelId: cfg.newapi.channelId,
-    newStatus,
+  log('info', `NewAPI 渠道已${action === 'disable' ? '禁用' : '启用'}`, {
+    tag: cfg.newapi.tag,
     reason,
-  });
-  writeState({
-    channelKnownStatus: newStatus,
-    lastDisableAt: newStatus === cfg.newapi.statusDisabled ? Date.now() : null,
   });
   return json;
 }
 
-// ---------- 决策 ----------
-function decide(plan, state, nowMs) {
+// ---------- 决策（纯函数：只依赖当前查询结果）----------
+// 思路：
+//   - 用量 ≥ 阈值 → 调 NewAPI 禁用带 tag 的渠道
+//   - 用量 < 阈值 → 调 NewAPI 启用带 tag 的渠道
+//   - 不依赖任何本地缓存，reset 时间到了用量自然回到 0，下次轮询自动 enable
+//   - 依赖 NewAPI tag 接口幂等（已实测：连续调 enable 在已启用状态时仍返回 success=true）
+function decide(plan, nowMs) {
   const { usagePct, resetAtMs } = plan;
   if (usagePct == null) {
     return {
@@ -433,24 +411,6 @@ function decide(plan, state, nowMs) {
     };
   }
   if (usagePct >= cfg.threshold) {
-    if (state.channelKnownStatus === cfg.newapi.statusDisabled) {
-      return {
-        action: 'noop',
-        reason: `用量 ${usagePct.toFixed(2)}% ≥ 阈值 ${cfg.threshold}%，但渠道已停用`,
-        usagePct,
-      };
-    }
-    if (
-      cfg.abortDisableAfterMs > 0 &&
-      state.lastDisableAt != null &&
-      nowMs - state.lastDisableAt > cfg.abortDisableAfterMs
-    ) {
-      return {
-        action: 'skip',
-        reason: `用量 ${usagePct.toFixed(2)}% 已超阈值，但已超过放弃时长，跳过停用`,
-        usagePct,
-      };
-    }
     return {
       action: 'disable',
       reason: `用量 ${usagePct.toFixed(2)}% ≥ 阈值 ${cfg.threshold}%`,
@@ -458,30 +418,18 @@ function decide(plan, state, nowMs) {
       resetAtMs,
     };
   }
-
-  if (
-    state.channelKnownStatus === cfg.newapi.statusDisabled &&
-    resetAtMs != null &&
-    nowMs >= resetAtMs - cfg.enableLeadMs
-  ) {
-    return {
-      action: 'enable',
-      reason: `已到重置时间（${formatTime(resetAtMs)}）`,
-      usagePct,
-      resetAtMs,
-    };
-  }
-
+  // 用量 < 阈值：一律启用。新接口对"已是启用"幂等，无副作用。
+  const resetHint = resetAtMs ? `（reset 时间：${formatTime(resetAtMs)}）` : '';
   return {
-    action: 'noop',
-    reason: `用量 ${usagePct.toFixed(2)}% < 阈值 ${cfg.threshold}%，无需动作`,
+    action: 'enable',
+    reason: `用量 ${usagePct.toFixed(2)}% < 阈值 ${cfg.threshold}%，触发启用 ${resetHint}`.trim(),
     usagePct,
+    resetAtMs,
   };
 }
 
 // ---------- 单轮执行 ----------
 async function tick() {
-  const state = readState();
   const nowMs = Date.now();
 
   let plan;
@@ -505,23 +453,18 @@ async function tick() {
     log('debug', '按模型明细', { breakdown: plan.breakdown });
   }
 
-  const decision = decide(plan, state, nowMs);
+  const decision = decide(plan, nowMs);
   log('info', `决策：${decision.action}`, { reason: decision.reason });
-
-  // 记录最近一次 reset 时间，便于排查
-  if (plan.resetAtMs && plan.resetAtMs !== state.lastResetAt) {
-    writeState({ lastResetAt: plan.resetAtMs });
-  }
 
   if (decision.action === 'disable') {
     try {
-      await updateChannelStatus(cfg.newapi.statusDisabled, decision.reason);
+      await tagChannel('disable', decision.reason);
     } catch (e) {
       log('error', '停用渠道失败', { err: e.message });
     }
   } else if (decision.action === 'enable') {
     try {
-      await updateChannelStatus(cfg.newapi.statusEnabled, decision.reason);
+      await tagChannel('enable', decision.reason);
     } catch (e) {
       log('error', '启用渠道失败', { err: e.message });
     }
